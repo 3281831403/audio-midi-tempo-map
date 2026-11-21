@@ -19,14 +19,117 @@
 * 异常：非法 map、非正 BPM / 微秒/拍、非正 ppq、负 tick、负时间、
   非法 ratio 等统一抛 :class:`TempoError`。:func:`validate_map` 例外，
   它返回问题列表而不抛出。
-
-本模块初始为练习桩：8 个函数全部抛出 ``NotImplementedError``，等待实现。
 """
+
+import bisect
+import math
+
+#: value 小于该阈值按 BPM 解释，否则按微秒/拍解释。
+TEMPO_VALUE_THRESHOLD = 10000
+
+#: 每分钟 / 每秒的微秒数。
+MICROS_PER_MINUTE = 60_000_000
+MICROS_PER_SECOND = 1_000_000
+
+#: 空 map 时 :func:`tempo_at` 返回的 MIDI 默认速度。
+DEFAULT_BPM = 120.0
 
 
 class TempoError(ValueError):
     """速度映射、tick 或 ppq 非法时抛出的异常。"""
 
+
+# ---------------------------------------------------------------------------
+# 内部辅助
+# ---------------------------------------------------------------------------
+
+def _is_real_number(value) -> bool:
+    """是否为非布尔的 int/float。"""
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _is_finite_positive(value) -> bool:
+    return _is_real_number(value) and math.isfinite(value) and value > 0
+
+
+def _round_half_up(value: float) -> int:
+    """四舍五入，恰为 .5 时向上（区别于内置 round 的银行家舍入）。"""
+    return math.floor(value + 0.5)
+
+
+def _to_bpm(value: float) -> float:
+    """把 BPM 或微秒/拍统一换算成 BPM，调用方需先校验 value 合法。"""
+    if value < TEMPO_VALUE_THRESHOLD:
+        return float(value)
+    return MICROS_PER_MINUTE / value
+
+
+def _seconds_per_tick(value: float, ppq: int) -> float:
+    """该速度下每个 tick 对应的秒数：一拍时长 / ppq。"""
+    if value < TEMPO_VALUE_THRESHOLD:
+        # 60 秒/分钟 ÷ BPM 拍/分钟 = 每拍秒数，再除以每拍 tick 数。
+        return 60.0 / (float(value) * ppq)
+    return float(value) / MICROS_PER_SECOND / ppq
+
+
+def _check_ppq(ppq: int) -> None:
+    if not isinstance(ppq, int) or isinstance(ppq, bool) or ppq <= 0:
+        raise TempoError(f"non-positive ppq: {ppq!r}")
+
+
+def _check_tick(tick, what: str = "tick") -> None:
+    if not isinstance(tick, int) or isinstance(tick, bool) or tick < 0:
+        raise TempoError(f"negative or non-integer {what}: {tick!r}")
+
+
+def _prepare_events(events: list, ppq=None):
+    """排序去重并做完整合法性校验，返回归一化后的事件列表。
+
+    每个事件的 value 仍保留原始写法（BPM 或微秒/拍），换算在积分时
+    按需进行，避免提前取整损失精度。``ppq`` 给定时一并校验。
+    """
+    if ppq is not None:
+        _check_ppq(ppq)
+    normalized = normalize_events(events)
+    for tick, value in normalized:
+        # tick 必须是非负整数；负 tick 会让时间倒流。
+        if not isinstance(tick, int) or isinstance(tick, bool) or tick < 0:
+            raise TempoError(f"negative or non-integer tick: {tick!r}")
+        if not _is_finite_positive(value):
+            raise TempoError(f"non-positive bpm: {value!r}")
+    return normalized
+
+
+def _segment_starts(normalized: list) -> list:
+    """各段的起始 tick：首段固定从 0 开始，其后取各事件自身的 tick。"""
+    if not normalized:
+        return []
+    return [0] + [tick for tick, _ in normalized[1:]]
+
+
+def _integrate(normalized: list, ticks: int, ppq: int) -> float:
+    """已校验事件上的 tick→秒 分段积分，跨段从段起点继续累加。"""
+    if not normalized:
+        return 0.0
+    starts = _segment_starts(normalized)
+    elapsed = 0.0
+    for i, (_, value) in enumerate(normalized):
+        start = starts[i]
+        spt = _seconds_per_tick(value, ppq)
+        if i + 1 >= len(normalized):
+            # 末段开放延伸到任意大的 tick。
+            return elapsed + (ticks - start) * spt
+        end = starts[i + 1]
+        if ticks < end:
+            return elapsed + (ticks - start) * spt
+        # 整段走完，累计时间带入下一段。
+        elapsed += (end - start) * spt
+    return elapsed
+
+
+# ---------------------------------------------------------------------------
+# 公共 API
+# ---------------------------------------------------------------------------
 
 def normalize_events(events: list) -> list:
     """按 tick 升序排序并按 tick 去重，同 tick 的后写事件胜出。
@@ -50,8 +153,19 @@ def normalize_events(events: list) -> list:
     负 tick 会原样保留，交给 :func:`validate_map` 报告。事件不是
     二元组等结构性错误抛 :class:`TempoError`。
     """
+    try:
+        iterator = iter(events)
+    except TypeError:
+        raise TempoError(f"invalid event: {events!r}")
 
-    raise NotImplementedError("normalize_events 尚未实现")
+    # 同名键后写覆盖先写，天然实现 MIDI 的“同 tick 后写胜出”。
+    latest = {}
+    for event in iterator:
+        if not isinstance(event, (tuple, list)) or len(event) != 2:
+            raise TempoError(f"invalid event: {event!r}")
+        tick, value = event
+        latest[tick] = value
+    return sorted((tick, value) for tick, value in latest.items())
 
 
 def bpm_to_us(bpm: float) -> int:
@@ -75,8 +189,9 @@ def bpm_to_us(bpm: float) -> int:
 
     ``bpm <= 0``、``NaN`` 或 ``inf`` 抛 :class:`TempoError`。
     """
-
-    raise NotImplementedError("bpm_to_us 尚未实现")
+    if not _is_finite_positive(bpm):
+        raise TempoError(f"non-positive bpm: {bpm!r}")
+    return _round_half_up(MICROS_PER_MINUTE / bpm)
 
 
 def tick_to_seconds(events: list, ticks: int, ppq: int) -> float:
@@ -109,8 +224,9 @@ def tick_to_seconds(events: list, ticks: int, ppq: int) -> float:
     非法事件（负 tick、非正 tempo 等）、``ticks < 0``、``ppq <= 0``
     抛 :class:`TempoError`。tick 与秒往返误差不超过 1 tick。
     """
-
-    raise NotImplementedError("tick_to_seconds 尚未实现")
+    normalized = _prepare_events(events, ppq)
+    _check_tick(ticks)
+    return _integrate(normalized, ticks, ppq)
 
 
 def seconds_to_tick(events: list, seconds: float, ppq: int) -> int:
@@ -136,8 +252,27 @@ def seconds_to_tick(events: list, seconds: float, ppq: int) -> int:
     负秒数、非有限秒数、非法事件、``ppq <= 0`` 抛
     :class:`TempoError`。
     """
+    normalized = _prepare_events(events, ppq)
+    if not _is_real_number(seconds) or not math.isfinite(seconds) or seconds < 0:
+        raise TempoError(f"negative or non-finite seconds: {seconds!r}")
+    if not normalized:
+        return 0
 
-    raise NotImplementedError("seconds_to_tick 尚未实现")
+    starts = _segment_starts(normalized)
+    elapsed = 0.0
+    for i, (_, value) in enumerate(normalized):
+        start = starts[i]
+        spt = _seconds_per_tick(value, ppq)
+        if i + 1 >= len(normalized):
+            return _round_half_up(start + (seconds - elapsed) / spt)
+        end = starts[i + 1]
+        segment_seconds = (end - start) * spt
+        if seconds < elapsed + segment_seconds:
+            return _round_half_up(start + (seconds - elapsed) / spt)
+        # 越过整段：把该段累计时间带入下一段继续定位。
+        elapsed += segment_seconds
+    # 理论上不可达：末段是开放区间。
+    raise TempoError(f"seconds out of range: {seconds!r}")
 
 
 def tempo_at(events: list, tick: int) -> float:
@@ -160,8 +295,19 @@ def tempo_at(events: list, tick: int) -> float:
 
     负 tick、非法事件等抛 :class:`TempoError`。
     """
+    normalized = _prepare_events(events)
+    _check_tick(tick)
+    if not normalized:
+        return DEFAULT_BPM
 
-    raise NotImplementedError("tempo_at 尚未实现")
+    boundaries = [event_tick for event_tick, _ in normalized]
+    # bisect_right：tick 恰好等于事件 tick 时索引落在该事件上（后一段）；
+    # tick 早于首个事件时回退到首段（首段从 tick 0 生效）。
+    index = bisect.bisect_right(boundaries, tick) - 1
+    if index < 0:
+        index = 0
+    value = normalized[index][1]
+    return _to_bpm(value)
 
 
 def scale_map(events: list, ratio: float) -> list:
@@ -185,8 +331,10 @@ def scale_map(events: list, ratio: float) -> list:
 
     非法 ratio 或非法 map 抛 :class:`TempoError`，输入不被修改。
     """
-
-    raise NotImplementedError("scale_map 尚未实现")
+    if not _is_finite_positive(ratio):
+        raise TempoError(f"invalid scale ratio: {ratio!r}")
+    normalized = _prepare_events(events)
+    return [(tick, _to_bpm(value) * ratio) for tick, value in normalized]
 
 
 def validate_map(events: list, ppq: int) -> list[str]:
@@ -194,7 +342,7 @@ def validate_map(events: list, ppq: int) -> list[str]:
 
     参数
     ----
-    events : list[tuple[int, float]]
+    events : list
         待检查的事件序列。检查前按 :func:`normalize_events` 的规则排序
         去重，同 tick 的后写事件覆盖先写事件。
     ppq : int
@@ -214,8 +362,30 @@ def validate_map(events: list, ppq: int) -> list[str]:
 
     本函数不修改输入，也不抛 :class:`TempoError` 来表示 map 内容问题。
     """
+    problems: list[str] = []
 
-    raise NotImplementedError("validate_map 尚未实现")
+    # 结构非法的事件不入 map，只记录；其余按后写覆盖去重。
+    latest = {}
+    try:
+        iterator = iter(events)
+    except TypeError:
+        return [f"invalid event: {events!r}", f"non-positive ppq: {ppq!r}"]
+    for event in iterator:
+        if not isinstance(event, (tuple, list)) or len(event) != 2:
+            problems.append(f"invalid event: {event!r}")
+            continue
+        tick, value = event
+        latest[tick] = value
+
+    for tick, value in sorted(latest.items()):
+        if isinstance(tick, int) and not isinstance(tick, bool) and tick < 0:
+            problems.append(f"negative tick: {tick}")
+        if not _is_finite_positive(value):
+            problems.append(f"non-positive bpm: {value}")
+
+    if not isinstance(ppq, int) or isinstance(ppq, bool) or ppq <= 0:
+        problems.append(f"non-positive ppq: {ppq}")
+    return problems
 
 
 def map_batch(maps: list, ppq: int) -> dict:
@@ -248,5 +418,37 @@ def map_batch(maps: list, ppq: int) -> dict:
     任一 map 非法（缺字段、非正 tempo、负 tick、负目标 tick、非整数
     ticks 等）都抛 :class:`TempoError`，不返回部分结果，也不修改输入。
     """
+    _check_ppq(ppq)
+    if not isinstance(maps, list):
+        raise TempoError(f"invalid maps batch: {maps!r}")
 
-    raise NotImplementedError("map_batch 尚未实现")
+    # 第一阶段：全量校验并预处理，任一非法立即抛错，此时尚未产生输出。
+    prepared = []
+    for item in maps:
+        if not isinstance(item, dict):
+            raise TempoError(f"invalid map entry: {item!r}")
+        missing = {"name", "events", "ticks"}.difference(item)
+        if missing:
+            raise TempoError(f"map entry missing fields: {sorted(missing)}")
+        name = item["name"]
+        events = item["events"]
+        ticks = item["ticks"]
+        if not isinstance(name, str):
+            raise TempoError(f"invalid map name: {name!r}")
+        if not isinstance(ticks, list):
+            raise TempoError(f"invalid ticks list: {ticks!r}")
+        for tick in ticks:
+            _check_tick(tick, what="target tick")
+        normalized = _prepare_events(events, ppq)
+        prepared.append((name, normalized, ticks))
+
+    # 第二阶段：每张 map 独立从 tick 0 积分，累加器互不串用。
+    output_maps = []
+    map_names = []
+    for name, normalized, ticks in prepared:
+        seconds = [_integrate(normalized, tick, ppq) for tick in ticks]
+        output_maps.append({"name": name, "seconds": seconds})
+        map_names.append(name)
+
+    return {"maps": output_maps, "map_names": map_names,
+            "total_maps": len(map_names)}
